@@ -88,6 +88,7 @@ def make_buckets():
     ratios = [w/h for w,h in buckets]
     return buckets,ratios
 
+#this code is modified from https://note.com/kohya_ss/n/nbf7ce8d80f29
 def resize_from_buckets(image):
     aspect_ratio = image.width / image.height
     ar_errors = np.array(ratios) - aspect_ratio
