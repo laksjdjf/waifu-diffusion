@@ -26,6 +26,7 @@ import numpy as np
 import json
 import re
 import traceback
+import math
 
 try:
     pynvml.nvmlInit()
@@ -46,7 +47,6 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 # defaults should be good for everyone
 # TODO: add custom VAE support. should be simple with diffusers
-bool_t = lambda x: x.lower() in ['true', 'yes', '1']
 parser = argparse.ArgumentParser(description='Stable Diffusion Finetuner')
 parser.add_argument('--model', type=str, default=None, required=True, help='The name of the model to use for finetuning. Could be HuggingFace ID or a directory')
 parser.add_argument('--resume', type=str, default=None, help='The path to the checkpoint to resume from. If not specified, will create a new run.')
@@ -58,10 +58,10 @@ parser.add_argument('--bucket_side_max', type=int, default=768, help='The maximu
 parser.add_argument('--lr', type=float, default=5e-6, help='Learning rate')
 parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train for')
 parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-parser.add_argument('--use_ema', type=bool_t, default='False', help='Use EMA for finetuning')
+parser.add_argument('--use_ema', type=str, default='False', help='Use EMA for finetuning')
 parser.add_argument('--ucg', type=float, default=0.1, help='Percentage chance of dropping out the text condition per batch. Ranges from 0.0 to 1.0 where 1.0 means 100% text condition dropout.') # 10% dropout probability
-parser.add_argument('--gradient_checkpointing', dest='gradient_checkpointing', type=bool_t, default='False', help='Enable gradient checkpointing')
-parser.add_argument('--use_8bit_adam', dest='use_8bit_adam', type=bool_t, default='False', help='Use 8-bit Adam optimizer')
+parser.add_argument('--gradient_checkpointing', dest='gradient_checkpointing', type=str, default='False', help='Enable gradient checkpointing')
+parser.add_argument('--use_8bit_adam', dest='use_8bit_adam', type=str, default='False', help='Use 8-bit Adam optimizer')
 parser.add_argument('--adam_beta1', type=float, default=0.9, help='Adam beta1')
 parser.add_argument('--adam_beta2', type=float, default=0.999, help='Adam beta2')
 parser.add_argument('--adam_weight_decay', type=float, default=1e-2, help='Adam weight decay')
@@ -72,19 +72,28 @@ parser.add_argument('--seed', type=int, default=42, help='Seed for random number
 parser.add_argument('--output_path', type=str, default='./output', help='Root path for all outputs.')
 parser.add_argument('--save_steps', type=int, default=500, help='Number of steps to save checkpoints at.')
 parser.add_argument('--resolution', type=int, default=512, help='Image resolution to train against. Lower res images will be scaled up to this resolution and higher res images will be scaled down.')
-parser.add_argument('--shuffle', dest='shuffle', type=bool_t, default='True', help='Shuffle dataset')
+parser.add_argument('--shuffle', dest='shuffle', type=str, default='True', help='Shuffle dataset')
 parser.add_argument('--hf_token', type=str, default=None, required=False, help='A HuggingFace token is needed to download private models for training.')
 parser.add_argument('--project_id', type=str, default='diffusers', help='Project ID for reporting to WandB')
-parser.add_argument('--fp16', dest='fp16', type=bool_t, default='False', help='Train in mixed precision')
+parser.add_argument('--fp16', dest='fp16', type=str, default='False', help='Train in mixed precision')
 parser.add_argument('--image_log_steps', type=int, default=100, help='Number of steps to log images at.')
 parser.add_argument('--image_log_amount', type=int, default=4, help='Number of images to log every image_log_steps')
 parser.add_argument('--image_log_inference_steps', type=int, default=50, help='Number of inference steps to use to log images.')
 parser.add_argument('--image_log_scheduler', type=str, default="PNDMScheduler", help='Number of inference steps to use to log images.')
-parser.add_argument('--clip_penultimate', type=bool_t, default='False', help='Use penultimate CLIP layer for text embedding')
-parser.add_argument('--output_bucket_info', type=bool_t, default='False', help='Outputs bucket information and exits')
-parser.add_argument('--resize', type=bool_t, default='False', help="Resizes dataset's images to the appropriate bucket dimensions.")
-parser.add_argument('--use_xformers', type=bool_t, default='False', help='Use memory efficient attention')
+parser.add_argument('--clip_penultimate', type=str, default='False', help='Use penultimate CLIP layer for text embedding')
+parser.add_argument('--output_bucket_info', type=str, default='False', help='Outputs bucket information and exits')
+parser.add_argument('--resize', type=str, default='False', help="Resizes dataset's images to the appropriate bucket dimensions.")
+parser.add_argument('--use_xformers', type=str, default='False', help='Use memory efficient attention')
+parser.add_argument('--latent_cache', type=str, default='False', help='Calculate latent in advance')
+parser.add_argument('--nai_buckets', type=str, default='False', help='Use NovelAi original buckets')
 args = parser.parse_args()
+
+for arg in vars(args):
+    if type(getattr(args, arg)) == str:
+        if getattr(args, arg).lower() == 'true':
+            setattr(args, arg, True)
+        elif getattr(args, arg).lower() == 'false':
+            setattr(args, arg, False)
 
 def setup():
     torch.distributed.init_process_group("nccl", init_method="env://")
@@ -148,13 +157,18 @@ class ImageStore:
         self.data_dir = data_dir
 
         self.image_files = []
-        [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['jpg', 'jpeg', 'png', 'bmp', 'webp']]
+        if not args.latent_cache:
+            [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['jpg', 'jpeg', 'png', 'bmp', 'webp']]
+        else:
+            [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['npz']]
         self.image_files = [x for x in self.image_files if self.__valid_file(x)]
 
     def __len__(self) -> int:
         return len(self.image_files)
 
     def __valid_file(self, f) -> bool:
+        if args.latent_cache:
+            return True
         try:
             Image.open(f)
             return True
@@ -165,11 +179,17 @@ class ImageStore:
     # iterator returns images as PIL images and their index in the store
     def entries_iterator(self) -> Generator[Tuple[Image.Image, int], None, None]:
         for f in range(len(self)):
-            yield Image.open(self.image_files[f]).convert(mode='RGB'), f
+            if not args.latent_cache:
+                yield Image.open(self.image_files[f]).convert(mode='RGB'), f
+            else:
+                yield np.load(self.image_files[f])["arr_0"], f
 
     # get image by index
     def get_image(self, ref: Tuple[int, int, int]) -> Image.Image:
-        return Image.open(self.image_files[ref[0]]).convert(mode='RGB')
+        if not args.latent_cache:
+            return Image.open(self.image_files[ref[0]]).convert(mode='RGB')
+        else:
+            return np.load(self.image_files[ref[0]])["arr_0"]
 
     # gets caption by removing the extension from the filename and replacing it with .txt
     def get_caption(self, ref: Tuple[int, int, int]) -> str:
@@ -182,6 +202,8 @@ class ImageStore:
 # Bucketing code stolen from hasuwoof:   #
 # https://github.com/hasuwoof/huskystack #
 # ====================================== #
+
+#--nai_buckets bucketing is modified from https://note.com/kohya_ss/n/nbf7ce8d80f29
 
 class AspectBucket:
     def __init__(self, store: ImageStore,
@@ -215,43 +237,72 @@ class AspectBucket:
         self.fill_buckets()
 
     def init_buckets(self):
-        possible_lengths = list(range(self.bucket_length_min, self.bucket_length_max + 1, self.bucket_increment))
-        possible_buckets = list((w, h) for w, h in itertools.product(possible_lengths, possible_lengths)
-                        if w >= h and w * h <= self.max_image_area and w / h <= self.max_ratio)
+        if not args.nai_buckets:
+            possible_lengths = list(range(self.bucket_length_min, self.bucket_length_max + 1, self.bucket_increment))
+            possible_buckets = list((w, h) for w, h in itertools.product(possible_lengths, possible_lengths)
+                            if w >= h and w * h <= self.max_image_area and w / h <= self.max_ratio)
 
-        buckets_by_ratio = {}
+            buckets_by_ratio = {}
 
-        # group the buckets by their aspect ratios
-        for bucket in possible_buckets:
-            w, h = bucket
-            # use precision to avoid spooky floats messing up your day
-            ratio = '{:.4e}'.format(w / h)
+            # group the buckets by their aspect ratios
+            for bucket in possible_buckets:
+                w, h = bucket
+                # use precision to avoid spooky floats messing up your day
+                ratio = '{:.4e}'.format(w / h)
 
-            if ratio not in buckets_by_ratio:
-                group = set()
-                buckets_by_ratio[ratio] = group
-            else:
-                group = buckets_by_ratio[ratio]
+                if ratio not in buckets_by_ratio:
+                    group = set()
+                    buckets_by_ratio[ratio] = group
+                else:
+                    group = buckets_by_ratio[ratio]
 
-            group.add(bucket)
+                group.add(bucket)
 
-        # now we take the list of buckets we generated and pick the largest by area for each (the first sorted)
-        # then we put all of those in a list, sorted by the aspect ratio
-        # the square bucket (LxL) will be the first
-        unique_ratio_buckets = sorted([sorted(buckets, key=_sort_by_area)[-1]
-                                       for buckets in buckets_by_ratio.values()], key=_sort_by_ratio)
+            # now we take the list of buckets we generated and pick the largest by area for each (the first sorted)
+            # then we put all of those in a list, sorted by the aspect ratio
+            # the square bucket (LxL) will be the first
+            unique_ratio_buckets = sorted([sorted(buckets, key=_sort_by_area)[-1]
+                                           for buckets in buckets_by_ratio.values()], key=_sort_by_ratio)
 
-        # how many buckets to create for each side of the distribution
-        bucket_count_each = int(np.clip((self.requested_bucket_count + 1) / 2, 1, len(unique_ratio_buckets)))
+            # how many buckets to create for each side of the distribution
+            bucket_count_each = int(np.clip((self.requested_bucket_count + 1) / 2, 1, len(unique_ratio_buckets)))
 
-        # we know that the requested_bucket_count must be an odd number, so the indices we calculate
-        # will include the square bucket and some linearly spaced buckets along the distribution
-        indices = {*np.linspace(0, len(unique_ratio_buckets) - 1, bucket_count_each, dtype=int)}
+            # we know that the requested_bucket_count must be an odd number, so the indices we calculate
+            # will include the square bucket and some linearly spaced buckets along the distribution
+            indices = {*np.linspace(0, len(unique_ratio_buckets) - 1, bucket_count_each, dtype=int)}
 
-        # make the buckets, make sure they are unique (to remove the duplicated square bucket), and sort them by ratio
-        # here we add the portrait buckets by reversing the dimensions of the landscape buckets we generated above
-        buckets = sorted({*(unique_ratio_buckets[i] for i in indices),
-                          *(tuple(reversed(unique_ratio_buckets[i])) for i in indices)}, key=_sort_by_ratio)
+            # make the buckets, make sure they are unique (to remove the duplicated square bucket), and sort them by ratio
+            # here we add the portrait buckets by reversing the dimensions of the landscape buckets we generated above
+            buckets = sorted({*(unique_ratio_buckets[i] for i in indices),
+                              *(tuple(reversed(unique_ratio_buckets[i])) for i in indices)}, key=_sort_by_ratio)
+        else:
+            max_width, max_height = args.resolution,args.resolution
+            max_size = args.bucket_side_max
+            max_ratio = 2.0
+            divisible = 64
+            max_area = (max_width // divisible) * (max_height // divisible)
+
+            resos = set()
+
+            size = int(math.sqrt(max_area)) * divisible
+            resos.add((size, size))
+
+            size = args.bucket_side_min
+            while size <= max_size:
+                width = size
+                height = min(max_size, (max_area // (width // divisible)) * divisible)
+                ratio = width/height
+                if 1/max_ratio <= ratio <= max_ratio:
+                    resos.add((width, height))
+                    resos.add((height, width))
+
+                size += divisible
+
+            resos = list(resos)
+            ratios = [w/h for w,h in resos]
+            buckets = np.array(resos)[np.argsort(ratios)]
+            buckets = [(int(i),int(j)) for i,j in buckets]
+
 
         self.buckets = buckets
 
@@ -342,9 +393,11 @@ class AspectBucket:
 
         self.total_dropped = total_dropped
 
-    def _process_entry(self, entry: Image.Image, index: int) -> bool:
-        aspect = entry.width / entry.height
-
+    def _process_entry(self, entry, index: int) -> bool:
+        if not args.latent_cache:
+            aspect = entry.width / entry.height
+        else:
+            aspect = entry.shape[1]/entry.shape[2]
         if aspect > self.max_ratio or (1 / aspect) > self.max_ratio:
             return False
 
@@ -378,17 +431,18 @@ class AspectBucketSampler(torch.utils.data.Sampler):
         return self.bucket.get_batch_count() // self.num_replicas
 
 class AspectDataset(torch.utils.data.Dataset):
-    def __init__(self, store: ImageStore, tokenizer: CLIPTokenizer, ucg: float = 0.1):
+    def __init__(self, store: ImageStore, tokenizer: CLIPTokenizer, ucg: float = 0.1, latent_cache = False):
         self.store = store
         self.tokenizer = tokenizer
         self.ucg = ucg
+        
 
         self.transforms = torchvision.transforms.Compose([
-            torchvision.transforms.RandomHorizontalFlip(p=0.5),
+            torchvision.transforms.RandomHorizontalFlip(p=0.0),
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize([0.5], [0.5])
         ])
-
+        
     def __len__(self):
         return len(self.store)
 
@@ -396,7 +450,6 @@ class AspectDataset(torch.utils.data.Dataset):
         return_dict = {'pixel_values': None, 'input_ids': None}
 
         image_file = self.store.get_image(item)
-
         if args.resize:
             image_file = ImageOps.fit(
                 image_file,
@@ -405,8 +458,10 @@ class AspectDataset(torch.utils.data.Dataset):
                 centering=(0.5, 0.5),
                 method=Image.Resampling.LANCZOS
             )
-
-        return_dict['pixel_values'] = self.transforms(image_file)
+        if not args.latent_cache:
+            return_dict['pixel_values'] = self.transforms(image_file)
+        else:
+            return_dict['pixel_values'] = torch.from_numpy(image_file)
         if random.random() > self.ucg:
             caption_file = self.store.get_caption(item)
         else:
@@ -553,11 +608,13 @@ def main():
     
     tokenizer = CLIPTokenizer.from_pretrained(args.model, subfolder='tokenizer', use_auth_token=args.hf_token)
     text_encoder = CLIPTextModel.from_pretrained(args.model, subfolder='text_encoder', use_auth_token=args.hf_token)
-    vae = AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token)
+    if not args.latent_cache:
+        vae = AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token)
     unet = UNet2DConditionModel.from_pretrained(args.model, subfolder='unet', use_auth_token=args.hf_token)
 
     # Freeze vae and text_encoder
-    vae.requires_grad_(False)
+    if not args.latent_cache:
+        vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
     if args.gradient_checkpointing:
@@ -613,7 +670,8 @@ def main():
     weight_dtype = torch.float16 if args.fp16 else torch.float32
 
     # move models to device
-    vae = vae.to(device, dtype=weight_dtype)
+    if not args.latent_cache:
+        vae = vae.to(device, dtype=weight_dtype)
     unet = unet.to(device, dtype=torch.float32)
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
 
@@ -646,9 +704,10 @@ def main():
             if args.use_ema:
                 ema_unet.store(unet.parameters())
                 ema_unet.copy_to(unet.parameters())
+            
             pipeline = StableDiffusionPipeline(
                 text_encoder=text_encoder,
-                vae=vae,
+                vae=AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token),
                 unet=unet,
                 tokenizer=tokenizer,
                 scheduler=PNDMScheduler(
@@ -657,8 +716,8 @@ def main():
                 safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
                 feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
             )
-            print(f'saving checkpoint to: {args.output_path}/{args.run_name}_{global_step}')
-            pipeline.save_pretrained(f'{args.output_path}/{args.run_name}_{global_step}')
+            print(f'saving checkpoint to: {args.output_path}')
+            pipeline.save_pretrained(f'{args.output_path}')
 
             if args.use_ema:
                 ema_unet.restore(unet.parameters())
@@ -677,7 +736,10 @@ def main():
                     global_step += 1
                     continue
                 b_start = time.perf_counter()
-                latents = vae.encode(batch['pixel_values'].to(device, dtype=weight_dtype)).latent_dist.sample()
+                if not args.latent_cache:
+                    latents = vae.encode(batch['pixel_values'].to(device, dtype=weight_dtype)).latent_dist.sample()
+                else:
+                    latents = batch["pixel_values"].to(device, dtype=weight_dtype)
                 latents = latents * 0.18215
 
                 # Sample noise
@@ -762,7 +824,7 @@ def main():
 
                         pipeline = StableDiffusionPipeline(
                             text_encoder=text_encoder,
-                            vae=vae,
+                            vae=AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token),
                             unet=unet,
                             tokenizer=tokenizer,
                             scheduler=scheduler,
