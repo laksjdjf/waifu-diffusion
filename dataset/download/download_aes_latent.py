@@ -60,6 +60,7 @@ def pred_aesthetic(image):
     prediction = aes_model(torch.from_numpy(image_embeds).float().to('cuda'))
     return prediction.item()
 
+#this function is modified from https://note.com/kohya_ss/n/nbf7ce8d80f29
 def make_buckets():
     max_width, max_height = args.resolution,args.resolution
     max_size = args.bucket_side_max
@@ -88,7 +89,7 @@ def make_buckets():
     ratios = [w/h for w,h in buckets]
     return buckets,ratios
 
-#this code is modified from https://note.com/kohya_ss/n/nbf7ce8d80f29
+#this function is modified from https://note.com/kohya_ss/n/nbf7ce8d80f29
 def resize_from_buckets(image):
     aspect_ratio = image.width / image.height
     ar_errors = np.array(ratios) - aspect_ratio
@@ -129,6 +130,7 @@ def get_image_from_url(url):
     image = Image.open(requests.get(url, stream=True).raw).convert('RGB')
     return image
 
+#this class is modified from https://github.com/harubaru/waifu-diffusion/blob/main/dataset/download/download.py
 class CaptionProcessor(object):
     def __init__(self, copyright_rate, character_rate, general_rate, artist_rate, normalize, caption_shuffle, transforms, max_size, resize, random_order):
         self.copyright_rate = copyright_rate
