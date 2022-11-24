@@ -27,6 +27,7 @@ import json
 import re
 import traceback
 import math
+import ast
 
 try:
     pynvml.nvmlInit()
@@ -55,6 +56,7 @@ parser.add_argument('--dataset', type=str, default=None, required=True, help='Th
 parser.add_argument('--num_buckets', type=int, default=16, help='The number of buckets.')
 parser.add_argument('--bucket_side_min', type=int, default=256, help='The minimum side length of a bucket.')
 parser.add_argument('--bucket_side_max', type=int, default=768, help='The maximum side length of a bucket.')
+parser.add_argument('--max_ratio', type=float, default=2.0, help='The maximum aspect ratio a bucket.')
 parser.add_argument('--lr', type=float, default=5e-6, help='Learning rate')
 parser.add_argument('--epochs', type=int, default=10, help='Number of epochs to train for')
 parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
@@ -85,7 +87,8 @@ parser.add_argument('--output_bucket_info', type=str, default='False', help='Out
 parser.add_argument('--resize', type=str, default='False', help="Resizes dataset's images to the appropriate bucket dimensions.")
 parser.add_argument('--use_xformers', type=str, default='False', help='Use memory efficient attention')
 parser.add_argument('--latent_cache', type=str, default='False', help='Calculate latent in advance')
-parser.add_argument('--nai_buckets', type=str, default='False', help='Use NovelAi original buckets')
+parser.add_argument('--nai_buckets', type=str, default='False', help='Use NovelAI original buckets')
+parser.add_argument('--use_tagger', type=str, default='False', help='Use WD tagger')
 args = parser.parse_args()
 
 for arg in vars(args):
@@ -155,12 +158,12 @@ def _sort_by_area(bucket: tuple) -> float:
 class ImageStore:
     def __init__(self, data_dir: str) -> None:
         self.data_dir = data_dir
-
+        self.processor = CaptionProcessor(0,1,1,0,True,True)
         self.image_files = []
         if not args.latent_cache:
             [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['jpg', 'jpeg', 'png', 'bmp', 'webp']]
         else:
-            [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['npz']]
+            [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['npy']]
         self.image_files = [x for x in self.image_files if self.__valid_file(x)]
 
     def __len__(self) -> int:
@@ -182,20 +185,85 @@ class ImageStore:
             if not args.latent_cache:
                 yield Image.open(self.image_files[f]).convert(mode='RGB'), f
             else:
-                yield np.load(self.image_files[f])["arr_0"], f
+                yield np.load(self.image_files[f]), f
 
     # get image by index
     def get_image(self, ref: Tuple[int, int, int]) -> Image.Image:
         if not args.latent_cache:
             return Image.open(self.image_files[ref[0]]).convert(mode='RGB')
         else:
-            return np.load(self.image_files[ref[0]])["arr_0"]
+            return np.load(self.image_files[ref[0]])
 
     # gets caption by removing the extension from the filename and replacing it with .txt
     def get_caption(self, ref: Tuple[int, int, int]) -> str:
         filename = re.sub('\.[^/.]+$', '', self.image_files[ref[0]]) + '.txt'
         with open(filename, 'r', encoding='UTF-8') as f:
-            return f.read()
+        #    return f.read()
+            caption = self.processor(ast.literal_eval(f.read()))
+            return caption
+        
+class CaptionProcessor(object):
+    def __init__(self, copyright_rate, character_rate, general_rate, artist_rate, caption_shuffle, random_order):
+        self.copyright_rate = copyright_rate
+        self.character_rate = character_rate
+        self.general_rate = general_rate
+        self.artist_rate = artist_rate
+        self.caption_shuffle = caption_shuffle
+        self.random_order = random_order
+    
+    def clean(self, text: str):
+        text = ' '.join(set([i.lstrip('_').rstrip('_') for i in re.sub(r'\([^)]*\)', '', text).split(' ')])).lstrip().rstrip()
+        if self.caption_shuffle:
+            text = text.split(' ')
+            random.shuffle(text)
+            text = ' '.join(text)
+        text = ', '.join([i.replace('_', ' ') for i in text.split(' ')]).lstrip(', ').rstrip(', ')
+        return text
+
+    def get_key(self, val_dict, key, clean_val = True, cond_drop = 0.0, prepend_space = False, append_comma = False):
+        space = ' ' if prepend_space else ''
+        comma = ',' if append_comma else ''
+        
+        if key == "tag_string_character":
+            costume = str(set(re.findall("(?<=\().+?(?=\))", val_dict[key])))
+            space_2 = ' '
+            comma_2 = ','
+        else:
+            costume = ""
+            space_2 = ''
+            comma_2 = ''
+        if random.random() < cond_drop:
+            if (key in val_dict) and val_dict[key]:
+                if clean_val:
+                    return space + self.clean(val_dict[key]) + comma + space_2 + costume.replace("{","").replace("}","").replace("'","").replace("_"," ") + comma_2
+                else:
+                    return space + val_dict[key] + comma + " " + costume.replace("[","").replace("]","") + comma
+        return ''
+
+    def __call__(self, sample):
+        # preprocess caption
+        caption_data = sample
+        if not self.random_order:
+            character = self.get_key(caption_data, 'tag_string_character', False, self.character_rate, False, True)
+            copyright = self.get_key(caption_data, 'tag_string_copyright', True, self.copyright_rate, True, True)
+            artist = self.get_key(caption_data, 'tag_string_artist', True, self.artist_rate, True, True)
+            if not args.use_tagger:
+                general = self.get_key(caption_data, 'tag_string_general', True, self.general_rate, True, False)
+            else:
+                general = self.get_key(caption_data, 'tagger', True, self.general_rate, True, False)
+            tag_str = f'{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
+        else:
+            character = self.get_key(caption_data, 'tag_string_character', True, self.character_rate, False, True)
+            copyright = self.get_key(caption_data, 'tag_string_copyright', True, self.copyright_rate, True, True)
+            artist = self.get_key(caption_data, 'tag_string_artist', True, self.artist_rate, True, True)
+            if not args.use_tagger:
+                general = self.get_key(caption_data, 'tag_string_general', True, self.general_rate, True, True)
+            else:
+                general = self.get_key(caption_data, 'tagger', True, self.general_rate, True, True)
+            tag_str = f'{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
+        sample = tag_str
+
+        return sample
 
 
 # ====================================== #
@@ -276,34 +344,26 @@ class AspectBucket:
             buckets = sorted({*(unique_ratio_buckets[i] for i in indices),
                               *(tuple(reversed(unique_ratio_buckets[i])) for i in indices)}, key=_sort_by_ratio)
         else:
-            max_width, max_height = args.resolution,args.resolution
-            max_size = args.bucket_side_max
-            max_ratio = 2.0
-            divisible = 64
-            max_area = (max_width // divisible) * (max_height // divisible)
+            increment = 64
+            max_pixels = args.resolution*args.resolution
 
-            resos = set()
+            buckets = set()
+            buckets.add((args.resolution, args.resolution))
 
-            size = int(math.sqrt(max_area)) * divisible
-            resos.add((size, size))
-
-            size = args.bucket_side_min
-            while size <= max_size:
-                width = size
-                height = min(max_size, (max_area // (width // divisible)) * divisible)
+            width = args.bucket_side_min
+            while width <= args.bucket_side_max:
+                height = min(args.bucket_side_max, (max_pixels // width ) - (max_pixels // width ) % increment)
                 ratio = width/height
-                if 1/max_ratio <= ratio <= max_ratio:
-                    resos.add((width, height))
-                    resos.add((height, width))
-
-                size += divisible
-
-            resos = list(resos)
-            ratios = [w/h for w,h in resos]
-            buckets = np.array(resos)[np.argsort(ratios)]
+                if 1/args.max_ratio <= ratio <= args.max_ratio:
+                    buckets.add((width, height))
+                    buckets.add((height, width))
+                width += increment
+            buckets = list(buckets)
+            ratios = [w/h for w,h in buckets]
+            buckets = np.array(buckets)[np.argsort(ratios)]
             buckets = [(int(i),int(j)) for i,j in buckets]
 
-
+        print(buckets)
         self.buckets = buckets
 
         # cache the bucket ratios and the interpolator that will be used for calculating the best bucket later
@@ -431,7 +491,7 @@ class AspectBucketSampler(torch.utils.data.Sampler):
         return self.bucket.get_batch_count() // self.num_replicas
 
 class AspectDataset(torch.utils.data.Dataset):
-    def __init__(self, store: ImageStore, tokenizer: CLIPTokenizer, ucg: float = 0.1, latent_cache = False):
+    def __init__(self, store: ImageStore, tokenizer: CLIPTokenizer, ucg: float = 0.1):
         self.store = store
         self.tokenizer = tokenizer
         self.ucg = ucg
@@ -467,7 +527,6 @@ class AspectDataset(torch.utils.data.Dataset):
         else:
             caption_file = ''
         return_dict['input_ids'] = self.tokenizer(caption_file, max_length=self.tokenizer.model_max_length, padding='do_not_pad', truncation=True).input_ids
-
         return return_dict
 
     def collate_fn(self, examples):
@@ -650,7 +709,7 @@ def main():
 
     # load dataset
     store = ImageStore(args.dataset)
-    dataset = AspectDataset(store, tokenizer)
+    dataset = AspectDataset(store, tokenizer, ucg=args.ucg)
     bucket = AspectBucket(store, args.num_buckets, args.batch_size, args.bucket_side_min, args.bucket_side_max, 64, args.resolution * args.resolution, 2.0)
     sampler = AspectBucketSampler(bucket=bucket, num_replicas=world_size, rank=rank)
 
@@ -833,12 +892,13 @@ def main():
                         ).to(device)
                         # inference
                         images = []
+                        negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry"
                         with torch.no_grad():
                             with torch.autocast('cuda', enabled=args.fp16):
                                 for _ in range(args.image_log_amount):
                                     images.append(
                                         wandb.Image(pipeline(
-                                            prompt, num_inference_steps=args.image_log_inference_steps
+                                            prompt, num_inference_steps=args.image_log_inference_steps,negative_prompt=negative_prompt
                                         ).images[0],
                                         caption=prompt)
                                     )
