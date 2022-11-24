@@ -34,11 +34,11 @@ parser.add_argument('--out_file', '-o', type=str, required=False, default='datas
 parser.add_argument('--threads', '-p', required=False, default=16, type=int)
 parser.add_argument('--start', '-s', required=False, default=0, type=int)
 parser.add_argument('--end', '-e', required=False, type=int)
-parser.add_argument('--resolution', '-r', required=False, default=768, type=int,"bucketの解像度")
+parser.add_argument('--resolution', '-r', required=False, default=768, type=int,help="bucketの解像度")
 parser.add_argument('--min_length', required=False, default=512, type=int)
 parser.add_argument('--max_length', required=False, default=1024, type=int)
 parser.add_argument('--max_ratio', required=False, default=2.0, type=float)
-parser.add_argument('--aes_threshold', required=False, default=0.9, type=float,"aesthetic scoreの閾値")
+parser.add_argument('--aes_threshold', required=False, default=0.9, type=float,help="aesthetic scoreの閾値")
 parser.add_argument('--tag_threshold', required=False, default=-1, type=float,help="設定非推奨")
 args = parser.parse_args()
 
