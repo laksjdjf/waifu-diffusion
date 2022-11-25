@@ -50,6 +50,7 @@ class DownloadManager():
         self.max_threads = max_threads
         self.uuid = args.out_file
         self.buckets, self.ratios = self.make_buckets()
+        self.dic = {}
         if args.aes_threshold > 0:
             self.clipprocessor, self.clipmodel, self.aes_model = self.load_aesthetic_model()
         if args.tag_threshold > 0:
@@ -66,17 +67,25 @@ class DownloadManager():
                 pred = self.pred_aesthetic(image)
                 if pred < args.aes_threshold:
                     return
+            
                                                    
             image_bytes = io.BytesIO()
             image.save(image_bytes, format='PNG')
             __key__ = '%07d' % int(args_thread[0])
+            
+            if str(image.size) not in self.dic:
+                self.dic[str(image.size)] = [__key__]
+            else:
+                self.dic[str(image.size)].append(__key__)            
+            
+            
             image = image_bytes.getvalue()
-            with open(f'{self.uuid}/{__key__}.jpg', 'wb') as f:
+            with open(f'{self.uuid}/{__key__}.png', 'wb') as f:
                 f.write(image)
             
             #とりあえず保留
             if args.tag_threshold > 0:
-                img = dbimutils.smart_imread(f'{self.uuid}/{__key__}.jpg')
+                img = dbimutils.smart_imread(f'{self.uuid}/{__key__}.png')
                 img = dbimutils.smart_24bit(img)
                 img = dbimutils.make_square(img, 448)
                 img = dbimutils.smart_resize(img, 448)
@@ -132,6 +141,9 @@ class DownloadManager():
         for chunk in tqdm.tqdm(chunks):
             with futures.ThreadPoolExecutor(args.threads) as p:
                 p.map(self.download, chunk)
+                
+        with open(f'{self.uuid}/buckets.json',"w") as f:
+            f.write(json.dumps(self.dic))
 
         if len(self.failed_downloads) > 0:
             print("Failed downloads:")
