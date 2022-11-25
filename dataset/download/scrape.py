@@ -67,7 +67,7 @@ class DanbooruScraper():
                         if ('tag_string_artist' in j) and j['tag_string_artist']:
                             d_tags = set_val(j, d_tags, 'tag_string_artist')
                         if ('tag_string_character' in j) and j['tag_string_character']:
-                            d_tags = set_val(j, d_tags, 'tag_string_character')
+                            d_tags = set_val(j, d_tags, 'tag_string_character', clean_val = False)
                         if ('tag_string_general' in j) and j['tag_string_general']:
                             d_tags = set_val(j, d_tags, 'tag_string_general')           
                         if ('tag_string_meta' in j) and j['tag_string_meta']:
@@ -82,4 +82,4 @@ class DanbooruScraper():
 # now test
 if __name__ == "__main__":
     ds = DanbooruScraper(args.danbooru_username, args.danbooru_key)
-    ds.get_urls(args.tags, args.posts, 100, file=args.output)
+    ds.get_urls(args.tags, args.posts, 200, file=args.output)
