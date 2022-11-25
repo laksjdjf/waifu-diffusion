@@ -15,7 +15,7 @@ parser.add_argument('--output_path', '-o', type=str, required=True)
 parser.add_argument('--start', '-s', required=False, default=0, type=int)
 parser.add_argument('--end', '-e', required=False, type=int)
 parser.add_argument('--image_size', '-i', required=False, default=448, type=int)
-parser.add_argument('--batch_size', '-b', required=False, default=32, type=int)
+parser.add_argument('--batch_size', '-b', required=False, default=64, type=int)
 parser.add_argument('--threshold', '-t', required=False, default=0.35, type=float)
 args = parser.parse_args()
 
@@ -36,7 +36,7 @@ def main():
     batch_keys = []
     for i in tqdm(range(args.start,end_id)):
         file = files[i]
-        if "jpg" not in file:
+        if "png" not in file:
             continue
         img = dbimutils.smart_imread(path + file)
         img = dbimutils.smart_24bit(img)
