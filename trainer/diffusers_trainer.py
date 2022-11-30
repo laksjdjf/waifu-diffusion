@@ -35,7 +35,7 @@ except pynvml.nvml.NVMLError_LibraryNotFound:
     pynvml = None
 
 from typing import Iterable
-from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, PNDMScheduler, DDIMScheduler, StableDiffusionPipeline, DiffusionPipeline, EulerDiscreteScheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from diffusers.optimization import get_scheduler
 from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
@@ -89,6 +89,7 @@ parser.add_argument('--use_xformers', type=str, default='False', help='Use memor
 parser.add_argument('--latent_cache', type=str, default='False', help='Calculate latent in advance')
 parser.add_argument('--nai_buckets', type=str, default='False', help='Use NovelAI original buckets')
 parser.add_argument('--use_tagger', type=str, default='False', help='Use WD tagger')
+parser.add_argument('--v_prediction', type=str, default='False', help='v_prediction for sd 2.0')
 args = parser.parse_args()
 
 for arg in vars(args):
@@ -224,7 +225,7 @@ class CaptionProcessor(object):
         space = ' ' if prepend_space else ''
         comma = ',' if append_comma else ''
         
-        if key == "tag_string_character":
+        if key == "tag_string_character" and (key in val_dict):
             costume = str(set(re.findall("(?<=\().+?(?=\))", val_dict[key])))
             space_2 = ' '
             comma_2 = ','
@@ -764,7 +765,8 @@ def main():
                 ema_unet.store(unet.parameters())
                 ema_unet.copy_to(unet.parameters())
             
-            pipeline = StableDiffusionPipeline(
+            pipeline = StableDiffusionPipeline.from_pretrained(
+                args.model,
                 text_encoder=text_encoder,
                 vae=AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token),
                 unet=unet,
@@ -772,8 +774,8 @@ def main():
                 scheduler=PNDMScheduler(
                     beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
                 ),
-                safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
-                feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
+                #safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
+                #feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
             )
             print(f'saving checkpoint to: {args.output_path}')
             pipeline.save_pretrained(f'{args.output_path}')
@@ -822,6 +824,12 @@ def main():
                 # Predict the noise residual and compute loss
                 with torch.autocast('cuda', enabled=args.fp16):
                     noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    
+                alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps]
+                beta_prod_t = 1 - alpha_prod_t
+                alpha_prod_t = torch.reshape(alpha_prod_t, (len(alpha_prod_t), 1, 1, 1))    # broadcastされないらしいのでreshape
+                beta_prod_t = torch.reshape(beta_prod_t, (len(beta_prod_t), 1, 1, 1))
+                noise = (alpha_prod_t ** 0.5) * noise - (beta_prod_t ** 0.5) * latents
 
                 loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
@@ -881,18 +889,20 @@ def main():
                                 beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
                             )
 
-                        pipeline = StableDiffusionPipeline(
+                        pipeline = StableDiffusionPipeline.from_pretrained(
+                            args.model,
                             text_encoder=text_encoder,
                             vae=AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token),
                             unet=unet,
                             tokenizer=tokenizer,
-                            scheduler=scheduler,
+                            scheduler=DDIMScheduler.from_pretrained(args.model, subfolder="scheduler", prediction_type="v_prediction"),
                             safety_checker=None, # disable safety checker to save memory
-                            feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
+                            #feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
                         ).to(device)
                         # inference
                         images = []
                         negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry"
+                        #negative_prompt = ""
                         with torch.no_grad():
                             with torch.autocast('cuda', enabled=args.fp16):
                                 for _ in range(args.image_log_amount):
