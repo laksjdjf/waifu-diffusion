@@ -95,5 +95,50 @@ def main_batch():
             for i in range(len(files)):
                 np.save(output_path + files[i] + ".npy",latents[i])
                 
+def main_same_size():
+    vae = AutoencoderKL.from_pretrained(args.model, subfolder="vae")
+    vae.eval()
+    vae.to("cuda", dtype=torch.float16)
+    
+    to_tensor_norm = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ])
+    
+    path = args.directory.rstrip("/") + "/"
+    output_path = args.output_path.rstrip("/") + "/"
+    
+    all_files = os.listdir(args.directory)
+    if not os.path.exists(output_path):
+        os.mkdir(output_path)
+        
+    
+    image_tensors = []
+    files = []
+    for file in tqdm(all_files):
+        if "txt" in file:
+            continue
+        image = Image.open(path + file)
+        image_tensor = to_tensor_norm(image).to("cuda",torch.float16)
+        image_tensors.append(image_tensor)
+        files.append(file)
+        if len(files) == args.batch_size:
+            input_tensor = torch.stack(image_tensors)
+            with torch.no_grad():
+                latents = vae.encode(input_tensor).latent_dist.sample().float().to("cpu").numpy()
+            for i in range(len(files)):
+                np.save(output_path + files[i][:-4] + ".npy",latents[i])
+            image_tensors = []
+            files = []
+
+    if len(files) > 0:
+        input_tensor = torch.stack(image_tensors)
+        with torch.no_grad():
+            latents = vae.encode(input_tensor).latent_dist.sample().float().to("cpu").numpy()
+        for i in range(len(files)):
+            np.save(output_path + files[i][:-4] + ".npy",latents[i])
+    
+                
 if __name__ == "__main__":
-    main_batch()
+    main_same_size()
