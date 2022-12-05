@@ -31,7 +31,7 @@ from tensorflow.keras.models import load_model
 parser = argparse.ArgumentParser()
 parser.add_argument('--file', '-f', type=str, required=False, default='links.json')
 parser.add_argument('--out_file', '-o', type=str, required=False, default='datasets')
-parser.add_argument('--threads', '-p', required=False, default=16, type=int)
+parser.add_argument('--threads', '-p', required=False, default=12, type=int)
 parser.add_argument('--start', '-s', required=False, default=0, type=int)
 parser.add_argument('--end', '-e', required=False, type=int)
 parser.add_argument('--resolution', '-r', required=False, default=768, type=int,help="bucketの解像度")
