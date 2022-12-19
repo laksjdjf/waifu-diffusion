@@ -90,6 +90,8 @@ parser.add_argument('--latent_cache', type=str, default='False', help='Calculate
 parser.add_argument('--nai_buckets', type=str, default='False', help='Use NovelAI original buckets')
 parser.add_argument('--use_tagger', type=str, default='False', help='Use WD tagger')
 parser.add_argument('--v_prediction', type=str, default='False', help='v_prediction for sd 2.0')
+parser.add_argument('--train_cond', type=str, default='False', help='train text encoder')
+parser.add_argument('--full_fp16', type=str, default='False', help='fp16 grad')
 args = parser.parse_args()
 
 for arg in vars(args):
@@ -658,6 +660,14 @@ def main():
 
     # setup fp16 stuff
     scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    
+    if args.full_fp16:
+        org_unscale_grads = scaler._unscale_grads_
+
+        def _unscale_grads_replacer(optimizer, inv_scale, found_inf, allow_fp16):
+            return org_unscale_grads(optimizer, inv_scale, found_inf, True)
+
+        scaler._unscale_grads_ = _unscale_grads_replacer
 
     # Set seed
     torch.manual_seed(args.seed)
@@ -675,31 +685,16 @@ def main():
     # Freeze vae and text_encoder
     if not args.latent_cache:
         vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-
+    
+    if not args.train_cond:
+        text_encoder.requires_grad_(False)
+    
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
     
     if args.use_xformers:
         unet.set_use_memory_efficient_attention_xformers(True)
 
-    if args.use_8bit_adam: # Bits and bytes is only supported on certain CUDA setups, so default to regular adam if it fails.
-        try:
-            import bitsandbytes as bnb
-            optimizer_cls = bnb.optim.AdamW8bit
-        except:
-            print('bitsandbytes not supported, using regular Adam optimizer')
-            optimizer_cls = torch.optim.AdamW
-    else:
-        optimizer_cls = torch.optim.AdamW
-
-    optimizer = optimizer_cls(
-        unet.parameters(),
-        lr=args.lr,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=args.adam_epsilon,
-        weight_decay=args.adam_weight_decay,
-    )
 
     noise_scheduler = DDPMScheduler(
         beta_start=0.00085,
@@ -732,8 +727,26 @@ def main():
     # move models to device
     if not args.latent_cache:
         vae = vae.to(device, dtype=weight_dtype)
-    unet = unet.to(device, dtype=torch.float32)
+    unet = unet.to(device, dtype=torch.float16 if args.full_fp16 else torch.float32)
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
+    
+    if args.use_8bit_adam: # Bits and bytes is only supported on certain CUDA setups, so default to regular adam if it fails.
+        try:
+            import bitsandbytes as bnb
+            optimizer_cls = bnb.optim.AdamW8bit
+        except:
+            print('bitsandbytes not supported, using regular Adam optimizer')
+            optimizer_cls = torch.optim.AdamW
+    else:
+        optimizer_cls = torch.optim.AdamW
+
+    optimizer = optimizer_cls(
+        unet.parameters(),
+        lr=args.lr,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_epsilon,
+        weight_decay=args.adam_weight_decay,
+    )
 
     #unet = torch.nn.parallel.DistributedDataParallel(unet, device_ids=[rank], output_device=rank, gradient_as_bucket_view=True)
 
@@ -771,9 +784,7 @@ def main():
                 vae=AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token),
                 unet=unet,
                 tokenizer=tokenizer,
-                scheduler=PNDMScheduler(
-                    beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
-                ),
+                scheduler=DDIMScheduler.from_pretrained(args.model, subfolder="scheduler"),
                 #safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
                 #feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
             )
@@ -784,12 +795,19 @@ def main():
                 ema_unet.restore(unet.parameters())
         # barrier
         torch.distributed.barrier()
-
+        
     # train!
     try:
         loss = torch.tensor(0.0, device=device, dtype=weight_dtype)
         for epoch in range(args.epochs):
             unet.train()
+
+            if args.train_cond and (epoch <= args.epochs // 4):
+                text_encoder.train()
+                print("train text encoder!")
+            else:
+                text_encoder.requires_grad_(False)
+                #print("dont train text encoder!")
             for _, batch in enumerate(train_dataloader):
                 if args.resume and global_step < target_global_step:
                     if rank == 0:
@@ -822,14 +840,18 @@ def main():
                     encoder_hidden_states = encoder_hidden_states.last_hidden_state
 
                 # Predict the noise residual and compute loss
-                with torch.autocast('cuda', enabled=args.fp16):
+                if args.full_fp16:
                     noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                    
-                alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps]
-                beta_prod_t = 1 - alpha_prod_t
-                alpha_prod_t = torch.reshape(alpha_prod_t, (len(alpha_prod_t), 1, 1, 1))    # broadcastされないらしいのでreshape
-                beta_prod_t = torch.reshape(beta_prod_t, (len(beta_prod_t), 1, 1, 1))
-                noise = (alpha_prod_t ** 0.5) * noise - (beta_prod_t ** 0.5) * latents
+                else:
+                    with torch.autocast("cuda",enabled=args.fp16):
+                        noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                
+                if args.v_prediction:
+                    alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps]
+                    beta_prod_t = 1 - alpha_prod_t
+                    alpha_prod_t = torch.reshape(alpha_prod_t, (len(alpha_prod_t), 1, 1, 1))    # broadcastされないらしいのでreshape
+                    beta_prod_t = torch.reshape(beta_prod_t, (len(beta_prod_t), 1, 1, 1))
+                    noise = (alpha_prod_t ** 0.5) * noise - (beta_prod_t ** 0.5) * latents
 
                 loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
@@ -878,24 +900,13 @@ def main():
                         # get prompt from random batch
                         prompt = tokenizer.decode(batch['input_ids'][random.randint(0, len(batch['input_ids'])-1)].tolist())
 
-                        if args.image_log_scheduler == 'DDIMScheduler':
-                            print('using DDIMScheduler scheduler')
-                            scheduler = DDIMScheduler(
-                                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear"
-                            )
-                        else:
-                            print('using PNDMScheduler scheduler')
-                            scheduler=PNDMScheduler(
-                                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", skip_prk_steps=True
-                            )
-
                         pipeline = StableDiffusionPipeline.from_pretrained(
                             args.model,
                             text_encoder=text_encoder,
                             vae=AutoencoderKL.from_pretrained(args.model, subfolder='vae', use_auth_token=args.hf_token),
                             unet=unet,
                             tokenizer=tokenizer,
-                            scheduler=DDIMScheduler.from_pretrained(args.model, subfolder="scheduler", prediction_type="v_prediction"),
+                            scheduler=DDIMScheduler.from_pretrained(args.model, subfolder="scheduler"),
                             safety_checker=None, # disable safety checker to save memory
                             #feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
                         ).to(device)
