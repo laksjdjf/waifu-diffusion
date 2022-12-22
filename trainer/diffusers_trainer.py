@@ -92,6 +92,7 @@ parser.add_argument('--use_tagger', type=str, default='False', help='Use WD tagg
 parser.add_argument('--v_prediction', type=str, default='False', help='v_prediction for sd 2.0')
 parser.add_argument('--train_cond', type=str, default='False', help='train text encoder')
 parser.add_argument('--full_fp16', type=str, default='False', help='fp16 grad')
+parser.add_argument('--split_data', type=int,help='split data')
 args = parser.parse_args()
 
 for arg in vars(args):
@@ -167,8 +168,12 @@ class ImageStore:
             [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['jpg', 'jpeg', 'png', 'bmp', 'webp']]
         else:
             [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['npy']]
-        self.image_files = [x for x in self.image_files if self.__valid_file(x)]
-
+        
+        if args.split_data is None:
+            self.image_files = [x for x in self.image_files if self.__valid_file(x)]
+        else:
+            self.image_files = [x for x in self.image_files if self.__valid_file(x) and int(x[-5])%2 == args.split_data]
+        
     def __len__(self) -> int:
         return len(self.image_files)
 
@@ -188,7 +193,7 @@ class ImageStore:
             if not args.latent_cache:
                 yield Image.open(self.image_files[f]).convert(mode='RGB'), f
             else:
-                yield np.load(self.image_files[f]), f
+                yield self.image_files[f].split("/")[-1][:-4], f
 
     # get image by index
     def get_image(self, ref: Tuple[int, int, int]) -> Image.Image:
@@ -198,12 +203,11 @@ class ImageStore:
             return np.load(self.image_files[ref[0]])
 
     # gets caption by removing the extension from the filename and replacing it with .txt
-    def get_caption(self, ref: Tuple[int, int, int]) -> str:
+    def get_caption(self, ref: Tuple[int, int, int], ucg=False) -> str:
         filename = re.sub('\.[^/.]+$', '', self.image_files[ref[0]]) + '.txt'
         with open(filename, 'r', encoding='UTF-8') as f:
-        #    return f.read()
-            caption = self.processor(ast.literal_eval(f.read()))
-            return caption
+            caption = self.processor(ast.literal_eval(f.read()),ucg)
+        return caption
         
 class CaptionProcessor(object):
     def __init__(self, copyright_rate, character_rate, general_rate, artist_rate, caption_shuffle, random_order):
@@ -243,7 +247,7 @@ class CaptionProcessor(object):
                     return space + val_dict[key] + comma + " " + costume.replace("[","").replace("]","") + comma
         return ''
 
-    def __call__(self, sample):
+    def __call__(self, sample, ucg=False):
         # preprocess caption
         caption_data = sample
         if not self.random_order:
@@ -254,7 +258,11 @@ class CaptionProcessor(object):
                 general = self.get_key(caption_data, 'tag_string_general', True, self.general_rate, True, False)
             else:
                 general = self.get_key(caption_data, 'tagger', True, self.general_rate, True, False)
-            tag_str = f'{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
+                
+            if ucg:
+                tag_str = f'{character}'.lstrip().rstrip(',')
+            else:
+                tag_str = f'{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
         else:
             character = self.get_key(caption_data, 'tag_string_character', True, self.character_rate, False, True)
             copyright = self.get_key(caption_data, 'tag_string_copyright', True, self.copyright_rate, True, True)
@@ -263,7 +271,11 @@ class CaptionProcessor(object):
                 general = self.get_key(caption_data, 'tag_string_general', True, self.general_rate, True, True)
             else:
                 general = self.get_key(caption_data, 'tagger', True, self.general_rate, True, True)
-            tag_str = f'{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
+                
+            if ucg:
+                tag_str = f'{character}'.lstrip().rstrip(',')
+            else:
+                tag_str = f'{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
         sample = tag_str
 
         return sample
@@ -440,11 +452,28 @@ class AspectBucket:
     def fill_buckets(self):
         entries = self.store.entries_iterator()
         total_dropped = 0
-
-        for entry, index in tqdm.tqdm(entries, total=len(self.store)):
-            if not self._process_entry(entry, index):
-                total_dropped += 1
-
+        
+        if not args.latent_cache:
+            for entry, index in tqdm.tqdm(entries, total=len(self.store)):
+                if not self._process_entry(entry, index):
+                    total_dropped += 1
+                    
+        else:
+            with open(os.path.join(args.dataset,"buckets.json"),"r") as f:
+                metadata = json.load(f)
+            buckets = {}
+            
+            for key in metadata.keys():
+                bucket = tuple(map(int, key.strip('()').split(',')))
+                for idx in metadata[key]:
+                    buckets[idx] = bucket
+                    
+            for entry, index in tqdm.tqdm(entries, total=len(self.store)):    
+                if entry in buckets.keys():
+                    self.bucket_data[buckets[entry]].append(index)
+                else:
+                    self.bucket_data[(args.resolution,args.resolution)].append(index)
+            
         for b, values in self.bucket_data.items():
             # shuffle the entries for extra randomness and to make sure dropped elements are also random
             random.shuffle(values)
@@ -526,9 +555,9 @@ class AspectDataset(torch.utils.data.Dataset):
         else:
             return_dict['pixel_values'] = torch.from_numpy(image_file)
         if random.random() > self.ucg:
-            caption_file = self.store.get_caption(item)
+            caption_file = self.store.get_caption(item,False)
         else:
-            caption_file = ''
+            caption_file = self.store.get_caption(item,True)
         return_dict['input_ids'] = self.tokenizer(caption_file, max_length=self.tokenizer.model_max_length, padding='do_not_pad', truncation=True).input_ids
         return return_dict
 
