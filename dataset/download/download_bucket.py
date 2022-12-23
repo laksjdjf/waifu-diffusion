@@ -187,7 +187,7 @@ class DownloadManager():
             image = image.crop((left,0,right,bucket_height))
         else:
             temp_height = int(image.height*bucket_width/image.width)
-            image = image.resize((temp_height,bucket_width))
+            image = image.resize((bucket_width,temp_height))
             upper = (temp_height - bucket_height) / 2
             lower = bucket_height + upper
             image = image.crop((0,upper,bucket_width,lower))
