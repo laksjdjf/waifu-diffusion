@@ -44,6 +44,7 @@ from PIL import Image, ImageOps
 from typing import Dict, List, Generator, Tuple
 from scipy.interpolate import interp1d
 
+
 torch.backends.cuda.matmul.allow_tf32 = True
 
 # defaults should be good for everyone
@@ -93,6 +94,7 @@ parser.add_argument('--v_prediction', type=str, default='False', help='v_predict
 parser.add_argument('--train_cond', type=str, default='False', help='train text encoder')
 parser.add_argument('--full_fp16', type=str, default='False', help='fp16 grad')
 parser.add_argument('--split_data', type=int,help='split data')
+parser.add_argument('--lora', type=str,default='False',help='lora')
 args = parser.parse_args()
 
 for arg in vars(args):
@@ -101,7 +103,10 @@ for arg in vars(args):
             setattr(args, arg, True)
         elif getattr(args, arg).lower() == 'false':
             setattr(args, arg, False)
-
+if args.lora:
+    from lora_diffusion import inject_trainable_lora, extract_lora_up_downs
+            
+            
 def setup():
     torch.distributed.init_process_group("nccl", init_method="env://")
 
@@ -206,7 +211,7 @@ class ImageStore:
     def get_caption(self, ref: Tuple[int, int, int], ucg=False) -> str:
         filename = re.sub('\.[^/.]+$', '', self.image_files[ref[0]]) + '.txt'
         with open(filename, 'r', encoding='UTF-8') as f:
-            caption = self.processor(ast.literal_eval(f.read()),ucg)
+            caption = self.processor(ast.literal_eval(f.read().replace('"lazy"','lazy').replace('"love"','love')),ucg)
         return caption
         
 class CaptionProcessor(object):
@@ -759,6 +764,11 @@ def main():
     unet = unet.to(device, dtype=torch.float16 if args.full_fp16 else torch.float32)
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
     
+    if args.lora:
+        unet.requires_grad_(False)
+        unet_lora_params, _ = inject_trainable_lora(unet)
+    
+    
     if args.use_8bit_adam: # Bits and bytes is only supported on certain CUDA setups, so default to regular adam if it fails.
         try:
             import bitsandbytes as bnb
@@ -770,7 +780,7 @@ def main():
         optimizer_cls = torch.optim.AdamW
 
     optimizer = optimizer_cls(
-        unet.parameters(),
+        unet_lora_params if args.lora else unet.parameters(),
         lr=args.lr,
         betas=(args.adam_beta1, args.adam_beta2),
         eps=args.adam_epsilon,
