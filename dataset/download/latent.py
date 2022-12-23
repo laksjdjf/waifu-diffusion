@@ -63,6 +63,8 @@ def main_batch():
     path = args.directory.rstrip("/") + "/"
     output_path = args.output_path.rstrip("/") + "/"
     
+    exist_files = [file[:-4] for file in os.listdir(output_path) if ".npy" in file]
+    
     with open(path + "buckets.json" ,"r") as f:
         buckets = json.load(f)
     
@@ -75,6 +77,8 @@ def main_batch():
         files = []
         print(key)
         for file in tqdm(buckets[key]):
+            if file in exist_files:
+                continue
             image = Image.open(path + file + ".png")
             image_tensor = to_tensor_norm(image).to("cuda",torch.float16)
             image_tensors.append(image_tensor)
@@ -110,6 +114,7 @@ def main_same_size():
     output_path = args.output_path.rstrip("/") + "/"
     
     all_files = os.listdir(args.directory)
+    
     if not os.path.exists(output_path):
         os.mkdir(output_path)
         
@@ -141,4 +146,4 @@ def main_same_size():
     
                 
 if __name__ == "__main__":
-    main_same_size()
+    main_batch()
