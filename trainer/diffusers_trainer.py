@@ -80,7 +80,7 @@ parser.add_argument('--hf_token', type=str, default=None, required=False, help='
 parser.add_argument('--project_id', type=str, default='diffusers', help='Project ID for reporting to WandB')
 parser.add_argument('--fp16', dest='fp16', type=str, default='False', help='Train in mixed precision')
 parser.add_argument('--image_log_steps', type=int, default=100, help='Number of steps to log images at.')
-parser.add_argument('--image_log_amount', type=int, default=4, help='Number of images to log every image_log_steps')
+parser.add_argument('--image_log_amount', type=int, default=5, help='Number of images to log every image_log_steps')
 parser.add_argument('--image_log_inference_steps', type=int, default=50, help='Number of inference steps to use to log images.')
 parser.add_argument('--image_log_scheduler', type=str, default="PNDMScheduler", help='Number of inference steps to use to log images.')
 parser.add_argument('--clip_penultimate', type=str, default='False', help='Use penultimate CLIP layer for text embedding')
@@ -94,7 +94,10 @@ parser.add_argument('--v_prediction', type=str, default='False', help='v_predict
 parser.add_argument('--train_cond', type=str, default='False', help='train text encoder')
 parser.add_argument('--full_fp16', type=str, default='False', help='fp16 grad')
 parser.add_argument('--split_data', type=int,help='split data')
-parser.add_argument('--lora', type=str,default='False',help='lora')
+parser.add_argument('--lora', type=int,default=0,help='lora')
+parser.add_argument('--up_only', type=str,default='False',help='up only')
+parser.add_argument('--nen', type=str,default='False',help='nen prompt')
+parser.add_argument('--astolfo', type=str,default='False',help='train astolfo')
 args = parser.parse_args()
 
 for arg in vars(args):
@@ -104,7 +107,7 @@ for arg in vars(args):
         elif getattr(args, arg).lower() == 'false':
             setattr(args, arg, False)
 if args.lora:
-    from lora_diffusion import inject_trainable_lora, extract_lora_up_downs
+    from lora_diffusion import inject_trainable_lora, extract_lora_ups_down, save_lora_weight
             
             
 def setup():
@@ -167,7 +170,7 @@ def _sort_by_area(bucket: tuple) -> float:
 class ImageStore:
     def __init__(self, data_dir: str) -> None:
         self.data_dir = data_dir
-        self.processor = CaptionProcessor(0,1,1,0,True,True)
+        self.processor = CaptionProcessor(0,1,1,0,False,True)
         self.image_files = []
         if not args.latent_cache:
             [self.image_files.extend(glob.glob(f'{data_dir}' + '/*.' + e)) for e in ['jpg', 'jpeg', 'png', 'bmp', 'webp']]
@@ -211,7 +214,9 @@ class ImageStore:
     def get_caption(self, ref: Tuple[int, int, int], ucg=False) -> str:
         filename = re.sub('\.[^/.]+$', '', self.image_files[ref[0]]) + '.txt'
         with open(filename, 'r', encoding='UTF-8') as f:
-            caption = self.processor(ast.literal_eval(f.read().replace('"lazy"','lazy').replace('"love"','love')),ucg)
+            caption = self.processor(ast.literal_eval(f.read()),ucg)
+        if args.nen:
+            caption = "nen, " + caption
         return caption
         
 class CaptionProcessor(object):
@@ -224,6 +229,8 @@ class CaptionProcessor(object):
         self.random_order = random_order
     
     def clean(self, text: str):
+        if args.astolfo:
+            text = " ".join(list((set(text.split(" ")) - set(["long_hair","pink_hair","single_braid","male_focus","purple_eyes","1boy","multicolored_hair","hair_intakes","streaked_hair","white_hair","hair_between_eyes","simple_background","white_background",":d",";d"]))))
         text = ' '.join(set([i.lstrip('_').rstrip('_') for i in re.sub(r'\([^)]*\)', '', text).split(' ')])).lstrip().rstrip()
         if self.caption_shuffle:
             text = text.split(' ')
@@ -238,6 +245,9 @@ class CaptionProcessor(object):
         
         if key == "tag_string_character" and (key in val_dict):
             costume = str(set(re.findall("(?<=\().+?(?=\))", val_dict[key])))
+            if args.astolfo:
+                if "saber" in costume and "third_ascension" not in costume:
+                    costume = costume.replace("'saber'","'saber', 'first_saint_graph'")
             space_2 = ' '
             comma_2 = ','
         else:
@@ -276,13 +286,56 @@ class CaptionProcessor(object):
                 general = self.get_key(caption_data, 'tag_string_general', True, self.general_rate, True, True)
             else:
                 general = self.get_key(caption_data, 'tagger', True, self.general_rate, True, True)
+            
+            if "rating" in caption_data.keys():
+                rate = caption_data["rating"]
+                if rate == "g":
+                    rating = "safe, "
+                elif rate == "s":
+                    rating = "questionable, "
+                else:
+                    rating = "nsfw, "
+            else:
+                rating = ""
                 
+            if "score" in caption_data.keys():
+                point = caption_data["score"]
+                if point > 150:
+                    score = "masterpiece, "
+                elif point > 100:
+                    score = "best quality, "
+                elif point > 75:
+                    score = "high quality, "
+                elif point > 25:
+                    score = "medium quality, "
+                elif point < -5:
+                    score = "worst quality, "
+                elif point < 0:
+                    score = "low quality, "
+                else:
+                    score = ""
+            else:
+                score = ""
+            
+            metadata = ""
+            if "tag_string_meta" in caption_data.keys():
+                meta = caption_data["tag_string_meta"]
+                if "highres" in meta:
+                    metadata = "highres, "
+                
+                if "absurdres" in meta:
+                    metadata += "absurdres, "
+                    
+            if "is_deleted" in caption_data.keys():
+                if caption_data["is_deleted"] == "True":
+                    metadata += "deleted, "
+            
             if ucg:
                 tag_str = f'{character}'.lstrip().rstrip(',')
             else:
-                tag_str = f'{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
+                tag_str = f'{score}{metadata}{rating}{character}{copyright}{artist}{general}'.lstrip().rstrip(',')
+                
         sample = tag_str
-
         return sample
 
 
@@ -539,7 +592,7 @@ class AspectDataset(torch.utils.data.Dataset):
             torchvision.transforms.ToTensor(),
             torchvision.transforms.Normalize([0.5], [0.5])
         ])
-        
+
     def __len__(self):
         return len(self.store)
 
@@ -723,6 +776,10 @@ def main():
     if not args.train_cond:
         text_encoder.requires_grad_(False)
     
+    if args.up_only:
+        unet.down_blocks.requires_grad_(False)
+        unet.mid_block.requires_grad_(False)
+    
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
     
@@ -752,21 +809,17 @@ def main():
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_sampler=sampler,
-        num_workers=0,
+        num_workers=8,
         collate_fn=dataset.collate_fn
     )
 
     weight_dtype = torch.float16 if args.fp16 else torch.float32
 
-    # move models to device
-    if not args.latent_cache:
-        vae = vae.to(device, dtype=weight_dtype)
-    unet = unet.to(device, dtype=torch.float16 if args.full_fp16 else torch.float32)
-    text_encoder = text_encoder.to(device, dtype=weight_dtype)
     
     if args.lora:
         unet.requires_grad_(False)
-        unet_lora_params, _ = inject_trainable_lora(unet)
+        unet.conv_in.requires_grad_(True)
+        unet_lora_params, _ = inject_trainable_lora(unet,r=args.lora)
     
     
     if args.use_8bit_adam: # Bits and bytes is only supported on certain CUDA setups, so default to regular adam if it fails.
@@ -778,14 +831,29 @@ def main():
             optimizer_cls = torch.optim.AdamW
     else:
         optimizer_cls = torch.optim.AdamW
+    
+    if not args.up_only:
+        optimizer = optimizer_cls(
+            itertools.chain(*unet_lora_params) if args.lora else itertools.chain(unet.parameters(), text_encoder.parameters()) if args.train_cond  else unet.parameters(),
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_epsilon,
+            weight_decay=args.adam_weight_decay,
+        )
+    else:
+        optimizer = optimizer_cls(
+            unet.up_blocks.parameters(),
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_epsilon,
+            weight_decay=args.adam_weight_decay,
+        )
 
-    optimizer = optimizer_cls(
-        unet_lora_params if args.lora else unet.parameters(),
-        lr=args.lr,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=args.adam_epsilon,
-        weight_decay=args.adam_weight_decay,
-    )
+        # move models to device
+    if not args.latent_cache:
+        vae = vae.to(device, dtype=weight_dtype)
+    unet = unet.to(device, dtype=torch.float16 if args.full_fp16 else torch.float32)
+    text_encoder = text_encoder.to(device, dtype=torch.float32 if args.train_cond else weight_dtype)
 
     #unet = torch.nn.parallel.DistributedDataParallel(unet, device_ids=[rank], output_device=rank, gradient_as_bucket_view=True)
 
@@ -810,7 +878,7 @@ def main():
         num_training_steps=args.epochs * num_steps_per_epoch,
         #last_epoch=(global_step // num_steps_per_epoch) - 1,
     )
-
+       
     def save_checkpoint(global_step):
         if rank == 0:
             if args.use_ema:
@@ -827,6 +895,8 @@ def main():
                 #safety_checker=StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-safety-checker"),
                 #feature_extractor=CLIPFeatureExtractor.from_pretrained("openai/clip-vit-base-patch32"),
             )
+            if args.lora:
+                save_lora_weight(pipeline.unet, f'{args.output_path}.pt')
             print(f'saving checkpoint to: {args.output_path}')
             pipeline.save_pretrained(f'{args.output_path}')
 
@@ -835,18 +905,17 @@ def main():
         # barrier
         torch.distributed.barrier()
         
+                
     # train!
     try:
         loss = torch.tensor(0.0, device=device, dtype=weight_dtype)
         for epoch in range(args.epochs):
             unet.train()
 
-            if args.train_cond and (epoch <= args.epochs // 4):
-                text_encoder.train()
-                print("train text encoder!")
-            else:
+            if args.train_cond and (epoch == args.epochs // 4):
                 text_encoder.requires_grad_(False)
-                #print("dont train text encoder!")
+                text_encoder.eval()
+                print("stop train text encoder!")
             for _, batch in enumerate(train_dataloader):
                 if args.resume and global_step < target_global_step:
                     if rank == 0:
@@ -877,6 +946,7 @@ def main():
                     encoder_hidden_states = text_encoder.text_model.final_layer_norm(encoder_hidden_states['hidden_states'][-2])
                 else:
                     encoder_hidden_states = encoder_hidden_states.last_hidden_state
+                
 
                 # Predict the noise residual and compute loss
                 if args.full_fp16:
@@ -938,7 +1008,6 @@ def main():
                     if rank == 0:
                         # get prompt from random batch
                         prompt = tokenizer.decode(batch['input_ids'][random.randint(0, len(batch['input_ids'])-1)].tolist())
-
                         pipeline = StableDiffusionPipeline.from_pretrained(
                             args.model,
                             text_encoder=text_encoder,
@@ -951,14 +1020,16 @@ def main():
                         ).to(device)
                         # inference
                         images = []
-                        negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry"
-                        #negative_prompt = ""
+                        if not args.nen:
+                            negative_prompt = "lowres, bad anatomy, bad hands, text, error, missing fingers, extra digit, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry"
+                        else:
+                            negative_prompt = ""
                         with torch.no_grad():
                             with torch.autocast('cuda', enabled=args.fp16):
-                                for _ in range(args.image_log_amount):
+                                for i in range(args.image_log_amount):
                                     images.append(
                                         wandb.Image(pipeline(
-                                            prompt, num_inference_steps=args.image_log_inference_steps,negative_prompt=negative_prompt
+                                            prompt,height=768,width=768, num_inference_steps=args.image_log_inference_steps,negative_prompt=negative_prompt
                                         ).images[0],
                                         caption=prompt)
                                     )
