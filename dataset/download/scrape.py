@@ -72,6 +72,12 @@ class DanbooruScraper():
                             d_tags = set_val(j, d_tags, 'tag_string_general')           
                         if ('tag_string_meta' in j) and j['tag_string_meta']:
                             d_tags = set_val(j, d_tags, 'tag_string_meta')
+                        if ('score' in j) and j['score']:
+                            d_tags = set_val(j, d_tags, 'score',clean_val=False)
+                        if ('rating' in j) and j['rating']:
+                            d_tags = set_val(j, d_tags, 'rating',clean_val=False)
+                        if ('is_deleted' in j) and str(j['is_deleted']):
+                            d_tags['is_deleted'] = str(j['is_deleted'])
                         d_tags['file_url'] = j['file_url']
                         dict[j['id']] = d_tags
                 else:
