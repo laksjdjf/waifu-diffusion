@@ -56,11 +56,13 @@ class DownloadManager():
         if args.tag_threshold > 0:
             self.model = load_model("networks/ViTB16_11_03_2022_07h05m53s")
             self.label_names = pd.read_csv("2022_0000_0899_6549/selected_tags.csv")
+            
+        self.headers = {'User-Agent':'Mozilla/5.0'}
     
     # args = (post_id, link, caption_data)
     def download(self, args_thread):
         try:
-            image = Image.open(requests.get(args_thread[1], stream=True).raw).convert('RGB')
+            image = Image.open(requests.get(args_thread[1], stream=True,headers = self.headers).raw).convert('RGB')
             image = self.resize_image(image)
             
             if args.aes_threshold > 0:
